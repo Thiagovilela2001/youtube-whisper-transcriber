@@ -1,0 +1,26 @@
+# Ambientes e caches Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Modelos e resultados gerados
+modelos_whisper/
+transcricoes/
+downloads/
+*.mp3
+*.wav
+*.m4a
+*.webm
+*.part
+
+# Credenciais e configuracoes locais
+.env
+cookies.txt
+cookies-*.txt
+
+# Editores e sistema operacional
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
