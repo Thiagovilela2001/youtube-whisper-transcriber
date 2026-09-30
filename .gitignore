@@ -12,6 +12,7 @@ transcricoes/*.tmp
 *.log
 *.zip
 downloads/
+*.jsonl
 .tools/
 .teste_gpu/
 *.mp3

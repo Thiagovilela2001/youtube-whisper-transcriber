@@ -119,3 +119,53 @@ Para cada video, a pasta `transcricoes` recebe:
 
 Modelos, audios, transcricoes, logs, ambientes virtuais e arquivos de cookies
 sao ignorados pelo Git.
+
+---
+
+## Embeddings (1536 dimensões) e Busca Semântica (RAG)
+
+O projeto inclui um pipeline completo de embeddings em **1536 dimensões** e banco vetorial **ChromaDB** local para RAG (Retrieval-Augmented Generation).
+
+### Abordagem Otimizada para RAG de Vídeos
+
+1. **Chunking Temporal Semântico (`rag_chunker.py`)**:
+   - Agrupa os segmentos Whisper em blocos de ~250 palavras com sobreposição (overlap de ~50 palavras) para preservar o contexto.
+   - Mantém timestamps exatos (`start_time` e `end_time`).
+   - Gera automaticamente o link com minutagem exata no YouTube (`https://youtube.com/watch?v=...&t=123s`).
+   - Enriquece o texto do embedding com o contexto do título do vídeo e o intervalo de tempo correspondente.
+
+2. **Modelos em 1536 dimensões (`embedding_engine.py`)**:
+   - **Local (Multilíngue/Português):** `Alibaba-NLP/gte-Qwen2-1.5B-instruct` ou `infly/inf-retriever-v1-1.5b` (família Stella / Infini-AI, nativo em 1536d).
+   - **Local (Stella v5):** `dunzhang/stella_en_1.5B_v5`.
+   - **API (Nuvem):** OpenAI `text-embedding-3-small` (1536d) ou Infini-AI Cloud API (`https://cloud.infini-ai.com/maas/v1`).
+
+### Como gerar os embeddings
+
+**1. Modo Local (padrão):**
+```powershell
+.\.venv\Scripts\python.exe .\gerar_embeddings.py
+```
+*(Para testar apenas os primeiros 2 vídeos antes de rodar os 341: use `--limit 2`)*
+
+**2. Modo Local especificando modelo:**
+```powershell
+.\.venv\Scripts\python.exe .\gerar_embeddings.py --model "infly/inf-retriever-v1-1.5b"
+```
+
+**3. Modo API (OpenAI ou Infini-AI):**
+```powershell
+.\.venv\Scripts\python.exe .\gerar_embeddings.py --provider openai --api-key "SUA_CHAVE"
+```
+*(Ou definindo a variável de ambiente `$env:OPENAI_API_KEY = "sua_chave"`)*
+
+O processo é incremental: se você interromper, ele retoma de onde parou sem reprocessar vídeos já indexados.
+
+### Como pesquisar no banco (Busca RAG)
+
+Depois de gerados os embeddings, você pode fazer perguntas ou buscas semânticas diretamente pelo terminal:
+
+```powershell
+.\.venv\Scripts\python.exe .\buscar_rag.py "Como funciona a técnica 369 da lei da atração?"
+```
+
+O script retorna os trechos mais relevantes, a pontuação de similaridade, a minutagem exata e o **link clicável direto para o momento exato do vídeo no YouTube**!
