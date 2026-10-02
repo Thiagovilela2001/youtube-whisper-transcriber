@@ -338,21 +338,21 @@ def baixar_legendas(
             "skip_download": True,
             "writesubtitles": True,
             "writeautomaticsub": True,
-            "sub_langs": ["pt", "pt-BR", "en"],
-            "subformat": "vtt",
+            "subtitleslangs": ["pt-orig", "pt", "pt-BR", "pt-PT"],
+            "subtitlesformat": "vtt",
             "outtmpl": str(destino) + ".%(ext)s",
             "quiet": True,
             "no_warnings": True,
+            "ignoreerrors": True,
         },
     )
 
+    info = None
     try:
         with YoutubeDL(opcoes) as ydl:
             info = ydl.extract_info(url, download=True)
     except DownloadError:
-        return None
-    if not info:
-        return None
+        pass
 
     legendas = sorted(
         caminho
@@ -361,6 +361,18 @@ def baixar_legendas(
     )
     if not legendas:
         return None
+
+    if not info:
+        try:
+            opcoes_info = obter_opcoes_ytdlp(
+                cookies=cookies,
+                cookies_from_browser=cookies_from_browser,
+                extra_opcoes={"extract_flat": True, "quiet": True},
+            )
+            with YoutubeDL(opcoes_info) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception:
+            info = {"id": video_id, "title": video_id}
 
     segmentos: list[dict[str, Any]] = []
     for caminho in legendas:
