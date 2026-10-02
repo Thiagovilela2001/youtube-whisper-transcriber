@@ -73,6 +73,25 @@ def argumentos() -> argparse.Namespace:
         default="auto",
         help="Processador para o Whisper (padrao: auto; GPU usa Vulkan)",
     )
+    parser.add_argument(
+        "--sem-vad",
+        action="store_true",
+        help="Desliga o filtro de atividade de voz no caminho GPU. Sem ele, o "
+        "Whisper alucina texto sobre intros de musica e silencio.",
+    )
+    parser.add_argument(
+        "--preferir-legendas",
+        action="store_true",
+        help="Tenta usar as legendas que o YouTube já publica antes de rodar o "
+        "Whisper. Muito mais rapido e o texto costuma ser melhor. Cai no Whisper "
+        "quando o video nao tem legenda.",
+    )
+    parser.add_argument(
+        "--duracao-minima",
+        type=int,
+        default=60,
+        help="Ignora videos com menos de N segundos (padrao: 60; use 0 para desligar).",
+    )
     return parser.parse_args()
 
 
@@ -98,6 +117,61 @@ def ids_concluidos(arquivo: Path) -> set[str]:
         for linha in arquivo.read_text(encoding="utf-8").splitlines()
         if linha.strip()
     }
+
+
+class LockDeExecucao:
+    """
+    Impede que dois processos transcrevam o mesmo canal ao mesmo tempo.
+
+    Sem isto, dois `transcrever_canal.py` abertos leem o mesmo `.concluidos.txt`
+    no início, baixam e transcrevem os mesmos vídeos em paralelo, e o YouTube
+    responde "Sign in to confirm you're not a bot" — o próprio ritmo artificial que
+    o `--delay` existe para evitar.
+    """
+
+    def __init__(self, arquivo: Path):
+        self.arquivo = arquivo
+        self.ponte: Any = None
+
+    def __enter__(self) -> "LockDeExecucao":
+        self.arquivo.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            import fcntl
+        except ImportError:
+            # Sem fcntl (Windows), o arquivo é criado mas o lock é apenas
+            # advisory: ainda avisa se já existe um marcador de outra sessão.
+            if self.arquivo.exists():
+                raise SystemExit(
+                    f"ERRO: já existe um lock em {self.arquivo}.\n"
+                    "Se você tiver certeza de que nenhum processo está rodando, apague o arquivo."
+                ) from None
+            self.arquivo.write_text(str(os.getpid()), encoding="utf-8")
+            self.ponte = None
+            return self
+
+        self.ponte = self.arquivo.open("a+")
+        try:
+            fcntl.flock(self.ponte.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as erro:
+            self.ponte.close()
+            self.ponte = None
+            raise SystemExit(
+                f"ERRO: outra instância já está transcrevendo (lock em {self.arquivo}).\n"
+                f"Detalhe: {erro}"
+            ) from erro
+        self.ponte.seek(0)
+        self.ponte.truncate()
+        self.ponte.write(str(os.getpid()))
+        self.ponte.flush()
+        return self
+
+    def __exit__(self, *_excecao: Any) -> None:
+        if self.ponte is not None:
+            import fcntl
+
+            fcntl.flock(self.ponte.fileno(), fcntl.LOCK_UN)
+            self.ponte.close()
+        self.arquivo.unlink(missing_ok=True)
 
 
 def firefox_instalado_com_cookies() -> bool:
@@ -241,6 +315,67 @@ def baixar_audio(
     return localizar_audio(pasta, video_id), info
 
 
+def baixar_legendas(
+    url: str,
+    video_id: str,
+    pasta: Path,
+    cookies: Path | None = None,
+    cookies_from_browser: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    """
+    Tenta obter as legendas que o YouTube já publica, sem baixar áudio.
+
+    Vale a pena tentar antes do Whisper: transcrever 341 vídeos com `small`
+    leva horas e produz texto pior que a legenda de origem — o reconhecimento
+    de voz troca "saciedade" por "sociedade" e "momento" por "gerginha".
+    Quando não há legenda, devolve `None` e o chamador cai no Whisper.
+    """
+    destino = pasta / f"{video_id}"
+    opcoes = obter_opcoes_ytdlp(
+        cookies=cookies,
+        cookies_from_browser=cookies_from_browser,
+        extra_opcoes={
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "sub_langs": ["pt", "pt-BR", "en"],
+            "subformat": "vtt",
+            "outtmpl": str(destino) + ".%(ext)s",
+            "quiet": True,
+            "no_warnings": True,
+        },
+    )
+
+    try:
+        with YoutubeDL(opcoes) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except DownloadError:
+        return None
+    if not info:
+        return None
+
+    legendas = sorted(
+        caminho
+        for caminho in pasta.glob(f"{video_id}*.vtt")
+        if caminho.is_file()
+    )
+    if not legendas:
+        return None
+
+    segmentos: list[dict[str, Any]] = []
+    for caminho in legendas:
+        from legendas import ler_legenda
+
+        lidos = ler_legenda(caminho)
+        if len(lidos) > len(segmentos):
+            segmentos = lidos
+        caminho.unlink(missing_ok=True)
+
+    if not segmentos:
+        return None
+    return segmentos, info
+
+
 def transcrever_cpu(
     modelo: Any,
     audio: Path,
@@ -282,6 +417,7 @@ def transcrever_gpu(
     audio: Path,
     idioma: str | None,
     threads: int,
+    vad: bool = True,
 ) -> tuple[list[dict[str, Any]], str, float | None]:
     prefixo = audio.with_name(audio.stem + ".whisper")
     json_temporario = Path(f"{prefixo}.json")
@@ -303,6 +439,22 @@ def transcrever_gpu(
     ]
     if threads > 0:
         comando.extend(["-t", str(threads)])
+
+    # Sem VAD, o whisper.cpp transcreve intros de música e silêncio, e o modelo
+    # "small" alucina nesses trechos: foi a origem de lixo como "uma palavra
+    # constante na sua gerginha" e "sensação de sociedade" (era "saciedade").
+    # O caminho em CPU já usava vad_filter=True; aqui faltava.
+    if vad:
+        modelo_vad = whisper_vad_model()
+        if modelo_vad:
+            comando.extend(["--vad", "--vad-model", str(modelo_vad)])
+        else:
+            comando.append("--vad")
+            print(
+                "  [Aviso] --vad ativado sem modelo local; o whisper.cpp tentará "
+                "baixar o modelo de VAD.",
+                flush=True,
+            )
 
     probabilidade: float | None = None
     try:
@@ -343,8 +495,43 @@ def transcrever_gpu(
     return segmentos, idioma_detectado, probabilidade
 
 
+RAIZ = Path(__file__).resolve().parent
+
+#: Onde ficam o executável e os modelos do whisper.cpp. Relativo ao script, e
+#: não ao diretório atual: antes, rodar de outra pasta quebava silenciosamente.
+DIR_FERRAMENTAS = Path(os.environ.get("WHISPER_CPP_DIR") or RAIZ / ".tools" / "whisper-vulkan")
+DIR_MODELOS_CPP = Path(os.environ.get("WHISPER_CPP_MODELOS") or RAIZ / "modelos_whisper_cpp")
+
+
+def whisper_vad_model() -> Path | None:
+    """
+    Procura o modelo de VAD do whisper.cpp, que fica ao lado do executável.
+    Sem ele, o whisper.cpp tenta baixar na primeira execução.
+    """
+    if not DIR_FERRAMENTAS.exists():
+        return None
+    candidatos = sorted(DIR_FERRAMENTAS.glob("ggml-silero*.bin")) + sorted(
+        DIR_FERRAMENTAS.glob("ggml-vad*.bin")
+    )
+    return candidatos[0] if candidatos else None
+
+
 def arquivos_gpu(modelo: str) -> tuple[Path, Path]:
-    executavel = Path(".tools/whisper-vulkan/whisper-cli.exe")
+    """
+    Localiza o executável do whisper.cpp e o modelo.
+
+    O executável é procurado como `whisper-cli` e `whisper-cli.exe`: o nome
+    com extensão é o do build do Windows, mas o binário sem extensão funciona em
+    Linux e macOS, que o README também promete suportar.
+    """
+    executavel = next(
+        (
+            caminho
+            for nome in ("whisper-cli.exe", "whisper-cli", "main.exe", "main")
+            if (caminho := DIR_FERRAMENTAS / nome).is_file()
+        ),
+        DIR_FERRAMENTAS / ("whisper-cli.exe" if os.name == "nt" else "whisper-cli"),
+    )
     nomes_quantizados = {
         "tiny": "tiny-q5_1",
         "base": "base-q5_1",
@@ -359,7 +546,7 @@ def arquivos_gpu(modelo: str) -> tuple[Path, Path]:
         caminho_modelo = caminho_informado
     else:
         nome = nomes_quantizados.get(modelo, modelo)
-        caminho_modelo = Path("modelos_whisper_cpp") / f"ggml-{nome}.bin"
+        caminho_modelo = DIR_MODELOS_CPP / f"ggml-{nome}.bin"
     return executavel, caminho_modelo
 
 
@@ -433,10 +620,11 @@ def main() -> int:
     args.saida.mkdir(parents=True, exist_ok=True)
     pasta_audio = args.saida / ".audio_temporario"
     pasta_audio.mkdir(parents=True, exist_ok=True)
-    pasta_modelos = Path("modelos_whisper")
+    pasta_modelos = RAIZ / "modelos_whisper"
     pasta_modelos.mkdir(parents=True, exist_ok=True)
     arquivo_concluidos = args.saida / ".concluidos.txt"
     arquivo_erros = args.saida / "erros.log"
+    arquivo_lock = args.saida / ".transcrevendo.lock"
 
     cookies_from_browser = args.cookies_from_browser
     arquivo_cookies = args.cookies
@@ -480,6 +668,25 @@ def main() -> int:
         cookies=arquivo_cookies,
         cookies_from_browser=cookies_from_browser,
     )
+
+    # Vídeos curtos demais (e lives, que podem ter dezenas de horas) quase nunca
+    # produzem transcrição útil e custam caro. Com `extract_flat` a duração só
+    # aparece em parte das entradas, então a ausência não é tratada como 0.
+    if args.duracao_minima > 0:
+        antes = len(videos)
+        videos = [
+            v
+            for v in videos
+            if not v.get("is_live")
+            and (not v.get("duration") or float(v["duration"]) >= args.duracao_minima)
+        ]
+        if descartados := antes - len(videos):
+            print(
+                f"Filtro de duracao: {descartados} video(s) abaixo de "
+                f"{args.duracao_minima}s ou transmissao ao vivo foram ignorados.",
+                flush=True,
+            )
+
     pendentes = [video for video in videos if str(video.get("id")) not in concluidos]
     print(
         f"Canal: {len(videos)} videos encontrados; "
@@ -489,111 +696,138 @@ def main() -> int:
     if not pendentes:
         return 0
 
-    executavel_gpu, modelo_gpu = arquivos_gpu(args.modelo)
-    usar_gpu = args.dispositivo == "gpu" or (
-        args.dispositivo == "auto" and executavel_gpu.exists() and modelo_gpu.exists()
-    )
-    if usar_gpu:
-        if not executavel_gpu.exists():
-            raise FileNotFoundError(f"Executavel Vulkan nao encontrado: {executavel_gpu}")
-        if not modelo_gpu.exists():
-            raise FileNotFoundError(f"Modelo GPU nao encontrado: {modelo_gpu}")
-        print(f"Usando Whisper {args.modelo} na GPU/Vulkan: {modelo_gpu}", flush=True)
-        modelo_cpu = None
-    else:
-        if WhisperModel is None:
-            raise RuntimeError(
-                "faster-whisper nao esta instalado para o modo CPU. "
-                "Instale requirements.txt ou use --dispositivo gpu."
-            )
-        print(f"Carregando Whisper {args.modelo} em CPU/int8...", flush=True)
-        modelo_cpu = WhisperModel(
-            args.modelo,
-            device="cpu",
-            compute_type="int8",
-            cpu_threads=args.threads,
-            download_root=str(pasta_modelos),
+    with LockDeExecucao(arquivo_lock):
+        executavel_gpu, modelo_gpu = arquivos_gpu(args.modelo)
+        usar_gpu = args.dispositivo == "gpu" or (
+            args.dispositivo == "auto" and executavel_gpu.exists() and modelo_gpu.exists()
         )
-
-    falhas = 0
-    falhas_consecutivas_bot = 0
-    for indice, entrada in enumerate(pendentes, start=1):
-        video_id = str(entrada.get("id") or "")
-        if not video_id:
-            continue
-        url = entrada.get("webpage_url") or entrada.get("url")
-        if not str(url).startswith("http"):
-            url = f"https://www.youtube.com/watch?v={video_id}"
-        titulo = entrada.get("title") or video_id
-        audio: Path | None = None
-        print(f"[{indice}/{len(pendentes)}] {titulo} [{video_id}]", flush=True)
-        try:
-            audio, info_video = baixar_audio(
-                str(url),
-                video_id,
-                pasta_audio,
-                arquivo_cookies,
-                cookies_from_browser,
-            )
-            falhas_consecutivas_bot = 0
-            if usar_gpu:
-                segmentos, idioma, probabilidade = transcrever_gpu(
-                    executavel_gpu, modelo_gpu, audio, args.idioma, args.threads
+        if usar_gpu:
+            if not executavel_gpu.exists():
+                raise FileNotFoundError(f"Executavel Vulkan nao encontrado: {executavel_gpu}")
+            if not modelo_gpu.exists():
+                raise FileNotFoundError(f"Modelo GPU nao encontrado: {modelo_gpu}")
+            print(f"Usando Whisper {args.modelo} na GPU/Vulkan: {modelo_gpu}", flush=True)
+            modelo_cpu = None
+        else:
+            if WhisperModel is None:
+                raise RuntimeError(
+                    "faster-whisper nao esta instalado para o modo CPU. "
+                    "Instale requirements.txt ou use --dispositivo gpu."
                 )
-            else:
-                segmentos, idioma, probabilidade = transcrever_cpu(
-                    modelo_cpu, audio, args.idioma
-                )
-            arquivos = salvar_transcricao(
-                args.saida, info_video, segmentos, idioma, probabilidade
+            print(f"Carregando Whisper {args.modelo} em CPU/int8...", flush=True)
+            modelo_cpu = WhisperModel(
+                args.modelo,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=args.threads,
+                download_root=str(pasta_modelos),
             )
-            registrar_conclusao(arquivo_concluidos, video_id)
-            concluidos.add(video_id)
-            print("  Salvo: " + ", ".join(str(a) for a in arquivos), flush=True)
-            if args.delay > 0 and indice < len(pendentes):
-                time.sleep(args.delay)
-        except KeyboardInterrupt:
-            print("Interrompido. O progresso concluido foi preservado.", flush=True)
-            return 130
-        except Exception as erro:
-            falhas += 1
-            registrar_erro(arquivo_erros, video_id, erro)
-            msg_erro = str(erro)
-            print(f"  ERRO: {type(erro).__name__}: {erro}", file=sys.stderr, flush=True)
 
-            eh_erro_bot = (
-                "Sign in to confirm you’re not a bot" in msg_erro
-                or "Sign in to confirm you're not a bot" in msg_erro
-                or "Failed to decrypt with DPAPI" in msg_erro
-                or "HTTP Error 403" in msg_erro
-            )
-            if eh_erro_bot:
-                falhas_consecutivas_bot += 1
-                if falhas_consecutivas_bot >= args.max_falhas_bot:
-                    print(
-                        "\n" + "=" * 72 + "\n"
-                        "[BLOQUEIO DE BOT / ERRO DE COOKIES DETECTADO]\n"
-                        "O YouTube esta bloqueando as requisicoes e exigindo cookies/login.\n\n"
-                        "Como resolver:\n"
-                        " 1. Instale no seu navegador a extensao 'Get cookies.txt LOCALLY' ou 'Cookie-Editor'.\n"
-                        " 2. Acesse https://www.youtube.com logado em sua conta.\n"
-                        " 3. Clique na extensao e exporte os cookies como 'cookies.txt'.\n"
-                        " 4. Salve o arquivo 'cookies.txt' na pasta deste projeto:\n"
-                        f"    {Path.cwd().resolve()}\n"
-                        " 5. Execute novamente o comando. O script detectara o cookies.txt automaticamente!\n\n"
-                        " (Alternativa: Se tiver o Mozilla Firefox instalado, use: --cookies-from-browser firefox)\n"
-                        "=" * 72 + "\n",
-                        flush=True,
+        falhas = 0
+        falhas_consecutivas_bot = 0
+        for indice, entrada in enumerate(pendentes, start=1):
+            video_id = str(entrada.get("id") or "")
+            if not video_id:
+                continue
+            url = entrada.get("webpage_url") or entrada.get("url")
+            if not str(url).startswith("http"):
+                url = f"https://www.youtube.com/watch?v={video_id}"
+            titulo = entrada.get("title") or video_id
+            audio: Path | None = None
+            print(f"[{indice}/{len(pendentes)}] {titulo} [{video_id}]", flush=True)
+            try:
+                origem = "whisper"
+                resultado_legendas = None
+                if args.preferir_legendas:
+                    resultado_legendas = baixar_legendas(
+                        str(url),
+                        video_id,
+                        pasta_audio,
+                        arquivo_cookies,
+                        cookies_from_browser,
                     )
-                    break
-        finally:
-            if audio and audio.exists() and not args.manter_audio:
-                audio.unlink()
 
-    if not args.manter_audio and pasta_audio.exists() and not any(pasta_audio.iterdir()):
-        pasta_audio.rmdir()
-    print(f"Finalizado com {falhas} falha(s).", flush=True)
-    return 1 if falhas else 0
+                if resultado_legendas is not None:
+                    segmentos, info_video = resultado_legendas
+                    origem = "legendas"
+                    idioma = str(info_video.get("language") or args.idioma or "pt")
+                    probabilidade = None
+                else:
+                    audio, info_video = baixar_audio(
+                        str(url),
+                        video_id,
+                        pasta_audio,
+                        arquivo_cookies,
+                        cookies_from_browser,
+                    )
+                    falhas_consecutivas_bot = 0
+                    if usar_gpu:
+                        segmentos, idioma, probabilidade = transcrever_gpu(
+                            executavel_gpu,
+                            modelo_gpu,
+                            audio,
+                            args.idioma,
+                            args.threads,
+                            vad=not args.sem_vad,
+                        )
+                    else:
+                        segmentos, idioma, probabilidade = transcrever_cpu(
+                            modelo_cpu, audio, args.idioma
+                        )
+                arquivos = salvar_transcricao(
+                    args.saida, info_video, segmentos, idioma, probabilidade
+                )
+                registrar_conclusao(arquivo_concluidos, video_id)
+                concluidos.add(video_id)
+                print(
+                    f"  Salvo ({origem}, {len(segmentos)} segmentos): "
+                    + ", ".join(str(a) for a in arquivos),
+                    flush=True,
+                )
+                if args.delay > 0 and indice < len(pendentes):
+                    time.sleep(args.delay)
+            except KeyboardInterrupt:
+                print("Interrompido. O progresso concluido foi preservado.", flush=True)
+                return 130
+            except Exception as erro:
+                falhas += 1
+                registrar_erro(arquivo_erros, video_id, erro)
+                msg_erro = str(erro)
+                print(f"  ERRO: {type(erro).__name__}: {erro}", file=sys.stderr, flush=True)
+
+                eh_erro_bot = (
+                    "Sign in to confirm you’re not a bot" in msg_erro
+                    or "Sign in to confirm you're not a bot" in msg_erro
+                    or "Failed to decrypt with DPAPI" in msg_erro
+                    or "HTTP Error 403" in msg_erro
+                )
+                if eh_erro_bot:
+                    falhas_consecutivas_bot += 1
+                    if falhas_consecutivas_bot >= args.max_falhas_bot:
+                        print(
+                            "\n" + "=" * 72 + "\n"
+                            "[BLOQUEIO DE BOT / ERRO DE COOKIES DETECTADO]\n"
+                            "O YouTube esta bloqueando as requisicoes e exigindo cookies/login.\n\n"
+                            "Como resolver:\n"
+                            " 1. Instale no seu navegador a extensao 'Get cookies.txt LOCALLY' ou 'Cookie-Editor'.\n"
+                            " 2. Acesse https://www.youtube.com logado em sua conta.\n"
+                            " 3. Clique na extensao e exporte os cookies como 'cookies.txt'.\n"
+                            " 4. Salve o arquivo 'cookies.txt' na pasta deste projeto:\n"
+                            f"    {Path.cwd().resolve()}\n"
+                            " 5. Execute novamente o comando. O script detectara o cookies.txt automaticamente!\n\n"
+                            " (Alternativa: Se tiver o Mozilla Firefox instalado, use: --cookies-from-browser firefox)\n"
+                            "=" * 72 + "\n",
+                            flush=True,
+                        )
+                        break
+            finally:
+                if audio and audio.exists() and not args.manter_audio:
+                    audio.unlink()
+
+        if not args.manter_audio and pasta_audio.exists() and not any(pasta_audio.iterdir()):
+            pasta_audio.rmdir()
+        print(f"Finalizado com {falhas} falha(s).", flush=True)
+        return 1 if falhas else 0
 
 
 if __name__ == "__main__":

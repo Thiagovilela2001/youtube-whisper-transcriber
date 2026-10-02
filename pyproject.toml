@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "youtube-whisper-transcriber"
+version = "2.0.0"
+description = "Transcrição de vídeos do YouTube com Whisper e busca semântica local sobre as transcrições"
+readme = "README.md"
+requires-python = ">=3.10"
+
+# Mesmas versões de requirements.txt. `torch` é opcional de propósito: a
+# instalação difere entre CPU e GPU (ver requirements.txt).
+dependencies = [
+    "faster-whisper==1.2.1",
+    "yt-dlp==2026.8.19",
+    "chromadb==1.5.9",
+    "sentence-transformers==6.1.0",
+    "transformers==5.18.0",
+    "openai==3.22.1",
+    "tqdm==4.70.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.1"]
+
+[tool.setuptools]
+py-modules = [
+    "transcrever_canal",
+    "rag_chunker",
+    "embedding_engine",
+    "chroma_store",
+    "busca_lexical",
+    "gerar_embeddings",
+    "buscar_rag",
+    "testar_cookies",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",  # as mensagens de erro do CLI são longas de propósito
+    "B008",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]

@@ -1,136 +1,164 @@
+#!/usr/bin/env python3
 """
-Script para realizar buscas semânticas (RAG) no banco vetorial ChromaDB com transcrições do YouTube.
-Exibe trecho encontrado, vídeo correspondente, minutagem exata e link com timestamp direto no YouTube.
+Busca semântica (e lexical) nas transcrições indexadas.
+
+Combina similaridade de cosseno com BM25 e funde os dois rankings por RRF.
+Mostra o trecho, o vídeo, a minutagem e o link direto para o momento no YouTube.
 """
+
+from __future__ import annotations
 
 import argparse
-import sys
-from pathlib import Path
-import chromadb
+from typing import List
 
+from chroma_store import (
+    IncompatibilidadeDeModelo,
+    ResultadoBusca,
+    abrir_colecao,
+    buscar,
+    diversificar,
+)
 from embedding_engine import create_engine
 
 
-def search_transcripts(
-    query: str,
-    top_k: int = 5,
-    provider: str = "local",
-    model: str = None,
-    api_key: str = None,
-    base_url: str = None,
-    chroma_dir: str = "chroma_db",
-    collection_name: str = "youtube_transcricoes",
-    video_id_filter: str = None,
-):
-    chroma_path = Path(chroma_dir)
-    if not chroma_path.exists():
-        print(f"Erro: Banco ChromaDB não encontrado em '{chroma_dir}'.")
-        print("Execute primeiro: python gerar_embeddings.py")
-        sys.exit(1)
-
-    client = chromadb.PersistentClient(path=str(chroma_path))
-    try:
-        collection = client.get_collection(name=collection_name)
-    except Exception as e:
-        print(f"Erro ao acessar coleção '{collection_name}': {e}")
-        sys.exit(1)
-
-    total_docs = collection.count()
-    if total_docs == 0:
-        print(f"A coleção '{collection_name}' está vazia.")
-        return
-
-    # Inicializa engine para converter a query de busca no mesmo espaço vetorial 1536d
-    engine = create_engine(
-        provider=provider,
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
-    )
-
-    query_embedding = engine.get_embeddings([query])[0]
-
-    where_filter = None
-    if video_id_filter:
-        where_filter = {"video_id": video_id_filter}
-
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=min(top_k, total_docs),
-        where=where_filter,
-        include=["documents", "metadatas", "distances"],
-    )
-
-    print("\n" + "=" * 80)
-    print(f"PERGUNTA / BUSCA: \"{query}\"")
-    print(f"Total de registros na base: {total_docs} chunks")
-    print("=" * 80)
-
-    docs = results.get("documents", [[]])[0]
-    metas = results.get("metadatas", [[]])[0]
-    distances = results.get("distances", [[]])[0]
-
-    if not docs:
-        print("Nenhum resultado relevante encontrado.")
-        return
-
-    for rank, (doc, meta, dist) in enumerate(zip(docs, metas, distances), 1):
-        # Distância cosseno: quanto menor a distância, maior a similaridade
-        similarity = max(0.0, 1.0 - dist) * 100
-
-        title = meta.get("title", "Sem título")
-        upload_date = meta.get("upload_date", "")
-        start_str = meta.get("start_str", "00:00")
-        end_str = meta.get("end_str", "00:00")
-        timestamp_url = meta.get("timestamp_url", "")
-        chunk_idx = meta.get("chunk_index", 0)
-        total_chunks = meta.get("total_chunks", 1)
-
-        print(f"\n[Resultado #{rank}] - Similaridade: {similarity:.1f}%")
-        print(f"  Vídeo:     {title}")
-        if upload_date:
-            print(f"  Data:      {upload_date}")
-        print(f"  Momento:   {start_str} até {end_str} (Bloco {chunk_idx + 1} de {total_chunks})")
-        print(f"  Link Direto: {timestamp_url}")
-        print("  Trecho Transcrito:")
-        print(f"    \"{doc.strip()}\"")
-        print("-" * 80)
-
-
-def main():
+def argumentos() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Busca semântica no banco vetorial ChromaDB com transcrições do YouTube."
+        description="Busca híbrida (vetorial + BM25) nas transcrições do YouTube."
     )
-    parser.add_argument("query", type=str, help="Texto da pesquisa ou pergunta")
-    parser.add_argument("--top-k", type=int, default=5, help="Quantidade de resultados a retornar")
+    parser.add_argument("query", help="Texto da pesquisa ou pergunta")
+    parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--provider", default="local")
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--api-key", default=None)
+    parser.add_argument("--base-url", default=None)
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--chroma-dir", default="chroma_db")
+    parser.add_argument("--collection-name", default="youtube_transcricoes")
+    parser.add_argument("--video-id", default=None, help="Restringe a um vídeo específico")
     parser.add_argument(
-        "--provider",
-        type=str,
-        default="local",
-        choices=["local", "api", "openai", "infini-cloud", "stella"],
-        help="Provedor de embedding para a query",
+        "--peso-lexical",
+        type=float,
+        default=1.0,
+        help="Peso do BM25 na fusão RRF. 0 = só vetorial, 2 = dobra o peso.",
     )
-    parser.add_argument("--model", type=str, default=None, help="Nome do modelo de embedding")
-    parser.add_argument("--api-key", type=str, default=None, help="Chave de API (se usar provider 'api')")
-    parser.add_argument("--base-url", type=str, default=None, help="Base URL para API compatível com OpenAI")
-    parser.add_argument("--chroma-dir", type=str, default="chroma_db", help="Diretório do ChromaDB")
-    parser.add_argument("--collection-name", type=str, default="youtube_transcricoes", help="Nome da coleção")
-    parser.add_argument("--video-id", type=str, default=None, help="Filtrar por ID específico de vídeo")
+    parser.add_argument(
+        "--candidatos",
+        type=int,
+        default=50,
+        help="Quantos resultados cada modality considera antes da fusão.",
+    )
+    parser.add_argument(
+        "--min-score",
+        type=float,
+        default=0.0,
+        help="Descarta resultados com score RRF abaixo deste valor.",
+    )
+    parser.add_argument(
+        "--por-video",
+        type=int,
+        default=0,
+        help="Máximo de trechos de cada vídeo no resultado (0 = sem limite).",
+    )
+    return parser.parse_args()
 
-    args = parser.parse_args()
 
-    search_transcripts(
-        query=args.query,
-        top_k=args.top_k,
-        provider=args.provider,
-        model=args.model,
-        api_key=args.api_key,
-        base_url=args.base_url,
+def _origem(resultado: ResultadoBusca) -> str:
+    if resultado.ranque_vetorial is not None and resultado.ranque_lexical is not None:
+        return f"vetorial #{resultado.ranque_vetorial + 1} + lexical #{resultado.ranque_lexical + 1}"
+    if resultado.ranque_vetorial is not None:
+        return f"vetorial #{resultado.ranque_vetorial + 1}"
+    return f"lexical #{resultado.ranque_lexical + 1}"
+
+
+def mostrar(
+    consulta: str,
+    resultados: List[ResultadoBusca],
+    total_base: int,
+    modelo: str,
+) -> None:
+    print("\n" + "=" * 78)
+    print(f'CONSULTA: "{consulta}"')
+    print(f"Base: {total_base} blocos | modelo: {modelo}")
+    print("=" * 78)
+
+    if not resultados:
+        print("Nenhum resultado acima do limiar. Tente --min-score 0 ou outras palavras.")
+        return
+
+    for posicao, resultado in enumerate(resultados, 1):
+        meta = resultado.metadados
+        # Distância cosseno: 0 = idêntico, 2 = oposto. Em texto, valores abaixo
+        # de ~0.4 já indicam combinações fracas; por isso não se converte em
+        # "percentual de similaridade", que daria uma leitura enganosa.
+        distancia = (
+            f"cosseno {resultado.distancia:.3f}" if resultado.distancia is not None else "lexical"
+        )
+        print(f"\n[{posicao}] {distancia} | RRF {resultado.score_rrf:.4f} | {_origem(resultado)}")
+        print(f"  Vídeo:  {meta.get('title', '(sem título)')}")
+        if meta.get("upload_date"):
+            print(f"  Data:   {meta['upload_date']}")
+        print(
+            f"  Momento: {meta.get('start_str', '??:??')} → {meta.get('end_str', '??:??')}"
+            f"  (bloco {int(meta.get('chunk_index', 0)) + 1}"
+            f" de {int(meta.get('total_chunks', 1))})"
+        )
+        print(f"  Link:   {meta.get('timestamp_url', '')}")
+        print("  Trecho:")
+        print(f"    {resultado.documento.strip()}")
+        print("-" * 78)
+
+
+def main() -> int:
+    args = argumentos()
+
+    try:
+        engine = create_engine(
+            provider=args.provider,
+            model=args.model,
+            api_key=args.api_key,
+            base_url=args.base_url,
+            device=args.device,
+        )
+    except Exception as erro:
+        print(f"Falha ao iniciar o motor de embeddings: {erro}")
+        return 1
+
+    try:
+        collection = abrir_colecao(
+            args.chroma_dir, args.collection_name, engine.spec, criar=False
+        )
+    except IncompatibilidadeDeModelo as erro:
+        print(f"\n{erro}")
+        return 2
+    except FileNotFoundError as erro:
+        print(f"Erro: {erro}")
+        return 1
+
+    total = collection.count()
+    if not total:
+        print(f"A coleção '{args.collection_name}' está vazia.")
+        return 1
+
+    vetor = engine.embed_query(args.query)
+
+    resultados = buscar(
+        collection,
+        vetor,
+        args.query,
+        candidatos=args.candidatos,
+        hibrido=args.peso_lexical > 0,
+        peso_lexical=args.peso_lexical,
+        min_score=args.min_score,
+        where={"video_id": args.video_id} if args.video_id else None,
         chroma_dir=args.chroma_dir,
-        collection_name=args.collection_name,
-        video_id_filter=args.video_id,
     )
+
+    if args.por_video > 0:
+        resultados = diversificar(resultados, args.por_video)
+
+    mostrar(args.query, resultados[: args.top_k], total, engine.spec.nome)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

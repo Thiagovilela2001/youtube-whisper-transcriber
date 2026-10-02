@@ -1,166 +1,148 @@
+#!/usr/bin/env python3
 """
-Script principal para gerar embeddings de 1536 dimensões e indexar no banco vetorial ChromaDB.
+Gera embeddings das transcrições e indexa no ChromaDB.
+
+O processo é incremental: um manifesto em disco registra o que já foi
+indexado, evitando tanto reprocessar tudo quanto varrer a coleção inteira a
+cada execução.
 """
 
-import os
-import sys
-import json
+from __future__ import annotations
+
 import argparse
+import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Set
+from typing import Any, Dict, List, Tuple
 
-import chromadb
 from tqdm import tqdm
 
+from busca_lexical import invalidar_cache
+from chroma_store import (
+    IncompatibilidadeDeModelo,
+    abrir_colecao,
+    ler_manifesto,
+    reconstruir_manifesto,
+    salvar_manifesto,
+)
+from embedding_engine import create_engine
 from rag_chunker import chunk_transcript
-from embedding_engine import create_engine, EXPECTED_DIMENSION
+
+VERSAO_CHUNKER = 2
 
 
-def get_existing_video_ids(collection: chromadb.Collection) -> Set[str]:
-    """Obtém conjunto de IDs de vídeos que já foram indexados no ChromaDB."""
-    try:
-        results = collection.get(include=["metadatas"])
-        existing_ids = set()
-        for meta in results.get("metadatas", []):
-            if meta and "video_id" in meta:
-                existing_ids.add(meta["video_id"])
-        return existing_ids
-    except Exception as e:
-        print(f"[Aviso] Não foi possível verificar vídeos existentes: {e}")
-        return set()
-
-
-def main():
+def argumentos() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Gera embeddings de 1536 dimensões para transcrições do YouTube e salva no ChromaDB."
+        description="Gera embeddings das transcrições do YouTube e salva no ChromaDB."
     )
     parser.add_argument(
         "--provider",
-        type=str,
         default="local",
-        choices=["local", "api", "openai", "infini-cloud", "stella"],
-        help="Provedor de embeddings ('local' com SentenceTransformers ou 'api' / 'openai').",
+        help="'local' (sentence-transformers) ou 'api'/'openai'.",
+    )
+    parser.add_argument("--model", default=None, help="Nome do modelo de embeddings.")
+    parser.add_argument("--api-key", default=None, help="Chave de API, se provider for api.")
+    parser.add_argument("--base-url", default=None, help="Base URL compatível com OpenAI.")
+    parser.add_argument("--device", default=None, help="'cpu' ou 'cuda' para o modelo local.")
+    parser.add_argument("--transcricoes-dir", default="transcricoes")
+    parser.add_argument("--chroma-dir", default="chroma_db")
+    parser.add_argument("--collection-name", default="youtube_transcricoes")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--limit", type=int, default=None, help="Processa só N vídeos (teste).")
+    parser.add_argument("--export-jsonl", default=None, help="Exporta os embeddings em JSONL.")
+    parser.add_argument(
+        "--force", action="store_true", help="Reindexa os vídeos que já estão na base."
     )
     parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="Nome do modelo (ex: 'Alibaba-NLP/gte-Qwen2-1.5B-instruct', 'infly/inf-retriever-v1-1.5b', 'text-embedding-3-small').",
-    )
-    parser.add_argument(
-        "--api-key",
-        type=str,
-        default=None,
-        help="Chave de API (se usar provider 'api' ou 'openai').",
-    )
-    parser.add_argument(
-        "--base-url",
-        type=str,
-        default=None,
-        help="Base URL para API compatível com OpenAI (ex: 'https://cloud.infini-ai.com/maas/v1').",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        choices=["cpu", "cuda"],
-        help="Dispositivo para execução local ('cpu' ou 'cuda').",
-    )
-    parser.add_argument(
-        "--transcricoes-dir",
-        type=str,
-        default="transcricoes",
-        help="Diretório onde estão os arquivos .json das transcrições.",
-    )
-    parser.add_argument(
-        "--chroma-dir",
-        type=str,
-        default="chroma_db",
-        help="Diretório local para persistência do banco ChromaDB.",
-    )
-    parser.add_argument(
-        "--collection-name",
-        type=str,
-        default="youtube_transcricoes",
-        help="Nome da coleção no ChromaDB.",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=16,
-        help="Tamanho do lote para inferência de embeddings.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Limite de vídeos a processar (útil para testes rápidos).",
-    )
-    parser.add_argument(
-        "--export-jsonl",
-        type=str,
-        default=None,
-        help="Caminho opcional para exportar os embeddings gerados em formato JSONL.",
-    )
-    parser.add_argument(
-        "--force",
+        "--reindex",
         action="store_true",
-        help="Força reprocessamento de vídeos que já estejam no banco.",
+        help="Apaga a coleção e recria do zero (use ao trocar de modelo ou de chunking).",
     )
-
-    args = parser.parse_args()
-
-    transcricoes_path = Path(args.transcricoes_dir)
-    if not transcricoes_path.exists():
-        print(f"Erro: Diretório de transcrições '{args.transcricoes_dir}' não encontrado.")
-        sys.exit(1)
-
-    # 1. Encontrar todos os arquivos JSON
-    json_files = sorted(list(transcricoes_path.glob("*.json")))
-    print(f"Total de arquivos de transcrição encontrados: {len(json_files)}")
-
-    if not json_files:
-        print("Nenhum arquivo .json encontrado para processar.")
-        sys.exit(0)
-
-    # 2. Inicializar banco vetorial ChromaDB
-    chroma_path = Path(args.chroma_dir)
-    chroma_path.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(chroma_path))
-
-    # Cria ou obtém coleção configurada com distância cosseno
-    collection = client.get_or_create_collection(
-        name=args.collection_name,
-        metadata={"hnsw:space": "cosine", "embedding_dimensions": EXPECTED_DIMENSION},
+    parser.add_argument("--target-words", type=int, default=160, help="Palavras alvo por bloco.")
+    parser.add_argument("--overlap-words", type=int, default=30, help="Sobreposição entre blocos.")
+    parser.add_argument(
+        "--min-chunk-words",
+        type=int,
+        default=25,
+        help="Blocos com menos palavras são fundidos ao vizinho.",
     )
+    return parser.parse_args()
 
-    existing_videos = set() if args.force else get_existing_video_ids(collection)
-    if existing_videos:
-        print(f"Vídeos já indexados anteriormente no ChromaDB: {len(existing_videos)}")
 
-    # Filtra vídeos que ainda precisam ser processados
-    files_to_process = []
-    for f in json_files:
+def _mtime(caminho: Path) -> float:
+    try:
+        return caminho.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def selecionar_videos(
+    arquivos: List[Path],
+    manifesto: Dict[str, Any],
+    forcar: bool,
+) -> Tuple[List[Tuple[Path, Dict[str, Any]]], int, int]:
+    """
+    Decide o que processar. Um vídeo é reprocessado se ainda não existir no
+    manifesto, se a transcrição for mais nova que o registro, ou se `--force`.
+    """
+    conhecidos: Dict[str, Any] = manifesto.get("videos") or {}
+    a_processar: List[Tuple[Path, Dict[str, Any]]] = []
+    alterados = 0
+    ignorados = 0
+
+    for arquivo in arquivos:
         try:
-            with open(f, "r", encoding="utf-8") as fp:
-                data = json.load(fp)
-                vid_id = data.get("id", f.stem)
-                if args.force or vid_id not in existing_videos:
-                    files_to_process.append((f, data))
-        except Exception as e:
-            print(f"Erro ao ler {f.name}: {e}")
+            with arquivo.open("r", encoding="utf-8") as ponte:
+                dados = json.load(ponte)
+        except (OSError, json.JSONDecodeError) as erro:
+            print(f"[Aviso] Ignorando {arquivo.name}: {erro}")
+            continue
 
-    if args.limit and args.limit > 0:
-        files_to_process = files_to_process[: args.limit]
+        video_id = str(dados.get("id") or arquivo.stem)
+        registro = conhecidos.get(video_id)
+        desatualizado = registro is not None and registro.get("chunker") != VERSAO_CHUNKER
 
-    print(f"Vídeos selecionados para processamento nesta rodada: {len(files_to_process)}")
-    if not files_to_process:
-        print("Todos os vídeos já foram indexados! Use --force para reprocessar se desejar.")
-        return
+        if registro and not forcar and not desatualizado:
+            if _mtime(arquivo) <= float(registro.get("mtime") or 0.0):
+                ignorados += 1
+                continue
+            alterados += 1
+        elif desatualizado:
+            alterados += 1
 
-    # 3. Inicializar Engine de Embeddings
-    print("\nInicializando motor de embeddings (1536 dimensões)...")
+        a_processar.append((arquivo, dados))
+
+    return a_processar, alterados, ignorados
+
+
+def _remover_chunks_antigos(collection: Any, video_id: str) -> None:
+    """
+    Apaga todos os blocos de um vídeo antes de reinseri-lo.
+
+    Sem isso, um `upsert` por id deixaria para trás os blocos de índices
+    maiores quando a transcrição passasse a gerar menos blocos.
+    """
+    try:
+        collection.delete(where={"video_id": video_id})
+    except Exception as erro:
+        print(f"[Aviso] Não foi possível limpar os blocos antigos de {video_id}: {erro}")
+
+
+def main() -> int:
+    args = argumentos()
+
+    pasta_transcricoes = Path(args.transcricoes_dir)
+    if not pasta_transcricoes.exists():
+        print(f"Erro: '{args.transcricoes_dir}' não encontrado.")
+        return 1
+
+    arquivos = sorted(pasta_transcricoes.glob("*.json"))
+    print(f"Transcrições encontradas: {len(arquivos)}")
+    if not arquivos:
+        print("Nenhum .json para processar.")
+        return 0
+
     try:
         engine = create_engine(
             provider=args.provider,
@@ -169,90 +151,159 @@ def main():
             base_url=args.base_url,
             device=args.device,
         )
-    except Exception as e:
-        print(f"Falha ao inicializar o motor de embeddings: {e}")
-        sys.exit(1)
+    except Exception as erro:
+        print(f"Falha ao iniciar o motor de embeddings: {erro}")
+        return 1
 
-    # 4. Processar vídeos e gerar embeddings
-    total_chunks_indexed = 0
-    start_time = time.time()
+    spec = engine.spec
+    print(f"Modelo: {spec.resumo()}")
+    if spec.nota:
+        print(f"Contrato: {spec.nota}")
 
-    jsonl_fp = None
-    if args.export_jsonl:
-        jsonl_fp = open(args.export_jsonl, "a", encoding="utf-8")
+    pasta_chroma = Path(args.chroma_dir)
+    if args.reindex:
+        import chromadb
 
-    print("\nIniciando geração de embeddings e inserção no ChromaDB...\n")
+        cliente = chromadb.PersistentClient(path=str(pasta_chroma))
+        try:
+            cliente.delete_collection(args.collection_name)
+            print(f"[Reindex] Coleção '{args.collection_name}' removida.")
+        except Exception:
+            pass
+        invalidar_cache(pasta_chroma)
+        try:
+            (pasta_chroma / ".manifesto.json").unlink(missing_ok=True)
+        except OSError:
+            pass
 
     try:
-        with tqdm(total=len(files_to_process), desc="Processando vídeos", unit="vídeo") as pbar:
-            for file_path, data in files_to_process:
-                vid_id = data.get("id", file_path.stem)
-                title = data.get("title", file_path.stem)
+        collection = abrir_colecao(
+            pasta_chroma,
+            args.collection_name,
+            spec,
+            criar=True,
+            permitir_reindexacao=args.reindex,
+        )
+    except IncompatibilidadeDeModelo as erro:
+        print(f"\n{erro}")
+        return 2
 
-                # Divide o vídeo em blocos ideais para RAG com timestamps
-                chunks = chunk_transcript(data)
-                if not chunks:
-                    pbar.set_postfix_str(f"Ignorado (sem texto): {title[:30]}")
-                    pbar.update(1)
+    manifesto = ler_manifesto(pasta_chroma)
+    if not manifesto.get("videos") and collection.count() > 0:
+        print("[Manifesto] Ausente; reconstruindo a partir da coleção existente...")
+        manifesto = reconstruir_manifesto(collection)
+        salvar_manifesto(pasta_chroma, manifesto)
+
+    a_processar, alterados, ignorados = selecionar_videos(arquivos, manifesto, args.force)
+    print(f"A indexar: {len(a_processar)} | já atuais: {ignorados} | transcrição alterada: {alterados}")
+    if args.limit and args.limit > 0:
+        a_processar = a_processar[: args.limit]
+    if not a_processar:
+        print("Nada a fazer. Use --force ou --reindex para reprocessar.")
+        return 0
+
+    jsonl = None
+    if args.export_jsonl:
+        jsonl = Path(args.export_jsonl).open("a", encoding="utf-8")
+
+    videos_registro: Dict[str, Any] = dict(manifesto.get("videos") or {})
+    total_chunks = 0
+    inicio = time.time()
+    processados = 0
+
+    def gravar_manifesto() -> None:
+        salvar_manifesto(
+            pasta_chroma,
+            {
+                "videos": videos_registro,
+                "modelo": spec.nome,
+                "fingerprint": spec.fingerprint,
+                "dimensao": spec.dimensao,
+                "chunker": VERSAO_CHUNKER,
+                "atualizado_em": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            },
+        )
+
+    try:
+        with tqdm(total=len(a_processar), desc="Indexando", unit="vídeo") as barra:
+            for arquivo, dados in a_processar:
+                video_id = str(dados.get("id") or arquivo.stem)
+                titulo = str(dados.get("title") or arquivo.stem)
+
+                blocos = chunk_transcript(
+                    dados,
+                    target_words=args.target_words,
+                    overlap_words=args.overlap_words,
+                    min_chunk_words=args.min_chunk_words,
+                )
+                if not blocos:
+                    barra.set_postfix_str("sem texto")
+                    barra.update(1)
                     continue
 
-                texts_to_embed = [c["embedding_input"] for c in chunks]
-                chunk_ids = [c["id"] for c in chunks]
-                documents = [c["document"] for c in chunks]
-                metadatas = [c["metadata"] for c in chunks]
-
-                # Gera os vetores de 1536 dimensões
-                embeddings = engine.get_embeddings(texts_to_embed, batch_size=args.batch_size)
-
-                # Se force=True, remove eventuais chunks antigos deste vídeo no ChromaDB
-                if args.force:
-                    try:
-                        collection.delete(where={"video_id": vid_id})
-                    except Exception:
-                        pass
-
-                # Insere no ChromaDB
-                collection.upsert(
-                    ids=chunk_ids,
-                    embeddings=embeddings,
-                    documents=documents,
-                    metadatas=metadatas,
+                embeddings = engine.embed_documents(
+                    [b["document"] for b in blocos], batch_size=args.batch_size
                 )
 
-                # Exporta para JSONL se solicitado
-                if jsonl_fp:
-                    for cid, emb, doc, meta in zip(chunk_ids, embeddings, documents, metadatas):
-                        line = {
-                            "id": cid,
-                            "embedding": emb,
-                            "document": doc,
-                            "metadata": meta,
-                        }
-                        jsonl_fp.write(json.dumps(line, ensure_ascii=False) + "\n")
-                    jsonl_fp.flush()
+                _remover_chunks_antigos(collection, video_id)
+                collection.upsert(
+                    ids=[b["id"] for b in blocos],
+                    embeddings=embeddings,
+                    documents=[b["document"] for b in blocos],
+                    metadatas=[b["metadata"] for b in blocos],
+                )
 
-                total_chunks_indexed += len(chunks)
-                pbar.set_postfix_str(f"+{len(chunks)} chunks | {title[:25]}...")
-                pbar.update(1)
+                if jsonl:
+                    for bloco, vetor in zip(blocos, embeddings):
+                        jsonl.write(
+                            json.dumps(
+                                {
+                                    "id": bloco["id"],
+                                    "embedding": vetor,
+                                    "document": bloco["document"],
+                                    "metadata": bloco["metadata"],
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+                    jsonl.flush()
 
+                videos_registro[video_id] = {
+                    "chunks": len(blocos),
+                    "mtime": _mtime(arquivo),
+                    "chunker": VERSAO_CHUNKER,
+                    "fingerprint": spec.fingerprint,
+                }
+                total_chunks += len(blocos)
+                processados += 1
+                barra.set_postfix_str(f"+{len(blocos)} | {titulo[:24]}")
+                barra.update(1)
+
+                # Grava o manifesto a cada 25 vídeos: um reindex completo leva
+                # mais de uma hora, e perdê-lo significa refazer tudo. O upsert é
+                # idempotente, então o pior caso é trabalho repetido, não
+                # base corrompida.
+                if processados % 25 == 0:
+                    gravar_manifesto()
+                    invalidar_cache(pasta_chroma)
     finally:
-        if jsonl_fp:
-            jsonl_fp.close()
+        if jsonl:
+            jsonl.close()
 
-    elapsed = time.time() - start_time
+    gravar_manifesto()
+    invalidar_cache(pasta_chroma)
+
     print("\n" + "=" * 60)
-    print("PROCESSO CONCLUÍDO COM SUCESSO!")
-    print(f"- Total de vídeos processados: {len(files_to_process)}")
-    print(f"- Total de chunks indexados: {total_chunks_indexed}")
-    print(f"- Dimensão dos vetores: {EXPECTED_DIMENSION} dimensões")
-    print(f"- Banco ChromaDB salvo em: {chroma_path.resolve()}")
-    print(f"- Coleção ChromaDB: {args.collection_name}")
-    print(f"- Total de itens na coleção agora: {collection.count()}")
-    if args.export_jsonl:
-        print(f"- Arquivo JSONL exportado em: {Path(args.export_jsonl).resolve()}")
-    print(f"- Tempo decorrido: {elapsed:.1f} segundos")
+    print(f"Vídeos processados:   {len(a_processar)}")
+    print(f"Blocos indexados:     {total_chunks}")
+    print(f"Total na coleção:     {collection.count()}")
+    print(f"Modelo:               {spec.nome} ({spec.dimensao}d, fp={spec.fingerprint})")
+    print(f"Banco:                {pasta_chroma.resolve()}")
+    print(f"Tempo:                {time.time() - inicio:.1f}s")
     print("=" * 60)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

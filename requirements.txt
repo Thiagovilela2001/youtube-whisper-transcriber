@@ -1,6 +1,22 @@
+# Dependências do youtube-whisper-transcriber.
+#
+# Versões fixadas (antes eram `>=` soltas). O ChromaDB, em particular, mudou a
+# API de busca várias vezes em 2025-2026, e `query_texts` deixou de fazer BM25
+# e passou a exigir um embedding function: um `>=` solto quebra em silêncio.
+#
+# torch fica de fora de propósito: a instalação difere entre CPU e GPU.
+#   CPU:  pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu124
+# sentence-transformers puxa torch como dependência, então basta ter um deles.
+
 faster-whisper==1.2.1
 yt-dlp==2026.8.19
-chromadb>=1.5.0
-sentence-transformers>=3.0.0
-openai>=1.50.0
-tqdm>=4.60.0
+
+chromadb==1.5.9
+sentence-transformers==6.1.0
+transformers==5.18.0
+openai==3.22.1
+tqdm==4.70.1
+
+# Testes
+pytest==9.1.1
